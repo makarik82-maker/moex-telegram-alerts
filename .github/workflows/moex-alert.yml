@@ -1,0 +1,38 @@
+name: MOEX Telegram Alerts
+
+on:
+  schedule:
+    # Every 3 hours at minute 0 (UTC). MOEX trades ~07:00–15:50 UTC on weekdays.
+    - cron: "0 */3 * * *"
+  workflow_dispatch:
+
+jobs:
+  moex-alert:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run MOEX alert script
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CHANGE_THRESHOLD: "3"
+          TRADING_START_MSK: "10:00"
+          TRADING_END_MSK: "18:50"
+          # Optional comma-separated non-trading dates: 2026-01-01,2026-01-02
+          MOEX_HOLIDAYS: ${{ vars.MOEX_HOLIDAYS }}
+        run: python moex_alert.py
