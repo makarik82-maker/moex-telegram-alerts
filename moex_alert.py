@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch TOP-100 MOEX stock quotes and post movers (>3% from day open) to Telegram."""
+"""Fetch TOP-50 MOEX stock quotes and post movers (>3% from day open) to Telegram."""
 
 from __future__ import annotations
 
@@ -13,15 +13,27 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-MOEX_TOP_URL = "https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities.json"
 MOEX_STATUS_URL = (
     "https://iss.moex.com/iss/engines/stock/markets/shares/"
     "boards/TQBR/securities/SBER.json"
 )
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 MSK = ZoneInfo("Europe/Moscow")
-TOP_N = 100
 MAX_MOVERS_IN_MESSAGE = 30
+
+# ТОП-50 самых ликвидных акций MOEX (TQBR)
+TOP_50_TICKERS = [
+    "SBER", "GAZP", "LKOH", "GMKN", "NVTK",
+    "YNDX", "ROSN", "VTBR", "MGNT", "MTSS",
+    "ALRS", "CHMF", "MAGN", "NLMK", "PLZL",
+    "PHOR", "RUAL", "POLY", "TATN", "IRNK",
+    "MOEX", "AFLT", "PIKK", "FIVE", "RASP",
+    "SNGS", "SGZH", "HYDR", "FEES", "MSNG",
+    "OGKB", "UPRO", "ENPG", "VKCO", "OZON",
+    "TCSG", "CBOM", "CBRF", "BSPB", "VSMO",
+    "TRNF", "TRNFP", "SIBN", "AFKS", "MTLR",
+    "MTLRP", "CHMK", "NAKO", "BANE", "BANEP"
+]
 
 
 @dataclass(frozen=True)
@@ -136,80 +148,69 @@ def is_moex_trading_session(now: datetime | None = None) -> tuple[bool, str]:
     return True, "торговая сессия активна"
 
 
-def fetch_top_100_quotes() -> list[Quote]:
-    """Fetch TOP-100 MOEX stocks by trading volume."""
+def fetch_top_50_quotes() -> list[Quote]:
+    """Fetch quotes for TOP-50 stocks in a single request."""
     session = create_session()
     try:
-        # Загружаем все акции TQBR с объемами торгов
-        all_quotes = []
-        start = 0
-        page_size = 100
+        # MOEX ISS позволяет запрашивать несколько тикеров через запятую
+        tickers_str = ",".join(TOP_50_TICKERS)
+        
+        response = session.get(
+            "https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities.json",
+            params={
+                "iss.meta": "off",
+                "iss.only": "securities,marketdata",
+                "securities.columns": "SECID,SHORTNAME",
+                "marketdata.columns": "SECID,OPEN,LAST",
+                "secids": tickers_str,
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
 
-        while True:
-            response = session.get(
-                MOEX_TOP_URL,
-                params={
-                    "iss.meta": "off",
-                    "iss.only": "securities,marketdata",
-                    "securities.columns": "SECID,SHORTNAME",
-                    "marketdata.columns": "SECID,OPEN,LAST,VALUE",
-                    "start": start,
-                    "limit": page_size,
-                },
-                timeout=20,
-            )
-            response.raise_for_status()
-            payload = response.json()
+        securities = payload.get("securities", {}).get("data", [])
+        if not securities:
+            print("⚠️ No data received from MOEX")
+            return []
 
-            securities = payload["securities"]["data"]
-            if not securities:
-                break
+        sec_index = {name: idx for idx, name in enumerate(payload["securities"]["columns"])}
+        
+        md_dict = {}
+        if "marketdata" in payload and payload["marketdata"]["data"]:
+            md_columns = payload["marketdata"]["columns"]
+            md_index = {name: idx for idx, name in enumerate(md_columns)}
+            for md_row in payload["marketdata"]["data"]:
+                secid = md_row[md_index["SECID"]]
+                md_dict[secid] = {
+                    "OPEN": md_row[md_index["OPEN"]],
+                    "LAST": md_row[md_index["LAST"]]
+                }
 
-            sec_index = {name: idx for idx, name in enumerate(payload["securities"]["columns"])}
-            md_dict = {}
+        quotes = []
+        for sec_row in securities:
+            secid = sec_row[sec_index["SECID"]]
+            shortname = sec_row[sec_index["SHORTNAME"]]
+            md = md_dict.get(secid, {})
 
-            if "marketdata" in payload and payload["marketdata"]["data"]:
-                md_columns = payload["marketdata"]["columns"]
-                md_index = {name: idx for idx, name in enumerate(md_columns)}
-                for md_row in payload["marketdata"]["data"]:
-                    secid = md_row[md_index["SECID"]]
-                    md_dict[secid] = {
-                        "OPEN": md_row[md_index["OPEN"]],
-                        "LAST": md_row[md_index["LAST"]],
-                        "VALUE": md_row[md_index["VALUE"]]
-                    }
+            open_raw = md.get("OPEN")
+            last_raw = md.get("LAST")
 
-            for sec_row in securities:
-                secid = sec_row[sec_index["SECID"]]
-                shortname = sec_row[sec_index["SHORTNAME"]]
-                md = md_dict.get(secid, {})
+            if open_raw is None or last_raw is None:
+                continue
 
-                open_raw = md.get("OPEN")
-                last_raw = md.get("LAST")
-                value_raw = md.get("VALUE")
+            open_price = float(open_raw)
+            last_price = float(last_raw)
 
-                if open_raw is None or last_raw is None:
-                    continue
+            if open_price > 0 and last_price > 0:
+                quotes.append(Quote(
+                    secid=secid,
+                    shortname=shortname,
+                    open_price=open_price,
+                    last_price=last_price
+                ))
 
-                open_price = float(open_raw)
-                last_price = float(last_raw)
-                volume = float(value_raw) if value_raw is not None else 0
-
-                if open_price > 0 and last_price > 0:
-                    all_quotes.append((secid, shortname, open_price, last_price, volume))
-
-            if len(securities) < page_size:
-                break
-            start += page_size
-
-        # Сортируем по объему торгов и берем топ-100
-        all_quotes.sort(key=lambda x: x[4], reverse=True)
-        top_quotes = [
-            Quote(secid=q[0], shortname=q[1], open_price=q[2], last_price=q[3])
-            for q in all_quotes[:TOP_N]
-        ]
-
-        return top_quotes
+        return quotes
     finally:
         session.close()
 
@@ -235,7 +236,7 @@ def find_movers(quotes: list[Quote], threshold_pct: float) -> list[StockMove]:
 def format_header(threshold_pct: float, securities_checked: int) -> str:
     now = datetime.now(MSK)
     return (
-        f"<b>MOEX ТОП-{TOP_N} — изменение &gt; {threshold_pct:g}% с открытия</b>\n"
+        f"<b>MOEX ТОП-50 — изменение &gt; {threshold_pct:g}% с открытия</b>\n"
         f"<i>{now.strftime('%d.%m.%Y %H:%M')} MSK</i>\n"
         f"Проверено бумаг: {securities_checked}\n\n"
     )
@@ -245,7 +246,7 @@ def format_message(movers: list[StockMove], threshold_pct: float, securities_che
     header = format_header(threshold_pct, securities_checked)
     lines = []
     for move in movers:
-        direction = "" if move.change_pct > 0 else ""
+        direction = "🟢" if move.change_pct > 0 else "🔴"
         sign = "+" if move.change_pct > 0 else ""
         lines.append(
             f"{direction} <b>{move.secid}</b> ({move.shortname}): "
@@ -284,7 +285,7 @@ def send_telegram_message(token: str, chat_id: str, text: str) -> None:
 
 
 def main() -> None:
-    print(" Starting MOEX Alert Script (TOP-100)...")
+    print("🚀 Starting MOEX Alert Script (TOP-50)...")
     start_time = datetime.now()
 
     token = env("TELEGRAM_BOT_TOKEN")
@@ -294,18 +295,18 @@ def main() -> None:
     print("⏰ Checking if MOEX is trading...")
     is_trading, reason = is_moex_trading_session()
     if not is_trading:
-        print(f"️  Skipping run: {reason}")
+        print(f"⏸️  Skipping run: {reason}")
         return
 
-    print(f"📊 Fetching TOP-{TOP_N} MOEX stocks by volume...")
+    print("📊 Fetching TOP-50 MOEX stocks (single request)...")
     fetch_start = datetime.now()
-    quotes = fetch_top_100_quotes()
+    quotes = fetch_top_50_quotes()
     fetch_time = (datetime.now() - fetch_start).total_seconds()
     print(f"✅ Loaded {len(quotes)} stocks in {fetch_time:.1f}s")
 
     print(f"📈 Finding movers above {threshold}%...")
     movers = find_movers(quotes, threshold)
-    print(f"🎯 Found {len(movers)} movers")
+    print(f" Found {len(movers)} movers")
 
     if movers:
         displayed_movers = movers[:MAX_MOVERS_IN_MESSAGE]
@@ -315,7 +316,7 @@ def main() -> None:
     else:
         message = format_empty_message(threshold, len(quotes))
 
-    print(" Sending message to Telegram...")
+    print("📤 Sending message to Telegram...")
     send_start = datetime.now()
     send_telegram_message(token, chat_id, message)
     send_time = (datetime.now() - send_start).total_seconds()
