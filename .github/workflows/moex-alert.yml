@@ -2,13 +2,25 @@ name: MOEX Telegram Alerts
 
 on:
   schedule:
-    # Every 3 hours at minute 0 (UTC). MOEX trades ~07:00–15:50 UTC on weekdays.
-    - cron: "0 */3 * * *"
+    # Запуск в ключевые моменты торговых часов MOEX (07:00-15:50 UTC = 10:00-18:50 MSK)
+    # 07:00 UTC (10:00 MSK) - открытие рынка
+    # 10:00 UTC (13:00 MSK) - середина дня
+    # 13:00 UTC (16:00 MSK) - после обеда
+    # 15:00 UTC (18:00 MSK) - перед закрытием
+    # Только по будням (1-5 = Пн-Пт)
+    - cron: "0 7,10,13,15 * * 1-5"
   workflow_dispatch:
+    inputs:
+      threshold:
+        description: 'Change threshold percentage'
+        required: false
+        default: '3'
+        type: string
 
 jobs:
   moex-alert:
     runs-on: ubuntu-latest
+    timeout-minutes: 5  # Защита от зависания
     permissions:
       contents: read
 
@@ -26,13 +38,47 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Check required secrets
+        run: |
+          if [ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" ]; then
+            echo "::error::TELEGRAM_BOT_TOKEN secret is not set"
+            exit 1
+          fi
+          if [ -z "${{ secrets.TELEGRAM_CHAT_ID }}" ]; then
+            echo "::error::TELEGRAM_CHAT_ID secret is not set"
+            exit 1
+          fi
+          echo "✅ All required secrets are configured"
+
+      - name: Display run information
+        run: |
+          echo "📊 MOEX Alert Configuration:"
+          echo "  Threshold: ${{ github.event.inputs.threshold || '3' }}%"
+          echo "  Trading hours: 10:00-18:50 MSK"
+          echo "  Current UTC time: $(date -u '+%Y-%m-%d %H:%M:%S')"
+          echo "  Current MSK time: $(TZ='Europe/Moscow' date '+%Y-%m-%d %H:%M:%S')"
+          if [ -n "${{ vars.MOEX_HOLIDAYS }}" ]; then
+            echo "  Configured holidays: ${{ vars.MOEX_HOLIDAYS }}"
+          else
+            echo "  No holidays configured (using default MOEX calendar check)"
+          fi
+
       - name: Run MOEX alert script
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          CHANGE_THRESHOLD: "3"
+          CHANGE_THRESHOLD: ${{ github.event.inputs.threshold || '3' }}
           TRADING_START_MSK: "10:00"
           TRADING_END_MSK: "18:50"
-          # Optional comma-separated non-trading dates: 2026-01-01,2026-01-02
           MOEX_HOLIDAYS: ${{ vars.MOEX_HOLIDAYS }}
+          PYTHONUNBUFFERED: "1"  # Для немедленного вывода логов
         run: python moex_alert.py
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "::error::MOEX alert script failed. Check the logs above for details."
+          echo "Possible issues:"
+          echo "  - MOEX ISS API is unavailable"
+          echo "  - Telegram Bot API error"
+          echo "  - Network connectivity issues"
