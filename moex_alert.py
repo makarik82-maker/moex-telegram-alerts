@@ -20,6 +20,7 @@ MOEX_STATUS_URL = (
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 MSK = ZoneInfo("Europe/Moscow")
 PAGE_SIZE = 100
+MAX_MOVERS_IN_MESSAGE = 30  # Ограничение для предотвращения превышения лимита 4096 символов
 
 # Prefer main boards when the same ticker is listed on several modes.
 BOARD_PRIORITY = {
@@ -116,7 +117,8 @@ def market_has_today_quotes() -> bool:
     if not systime_raw:
         return False
 
-    systime = datetime.fromisoformat(str(systime_raw)).replace(tzinfo=MSK)
+    # replace(" ", "T") обеспечивает совместимость с datetime.fromisoformat во всех версиях Python 3.10+
+    systime = datetime.fromisoformat(str(systime_raw).replace(" ", "T")).replace(tzinfo=MSK)
     today = datetime.now(MSK).date()
     if systime.date() != today:
         return False
@@ -146,6 +148,9 @@ def is_moex_trading_session(now: datetime | None = None) -> tuple[bool, str]:
                 return False, "биржа сегодня не торгует"
         except requests.RequestException as exc:
             print(f"Market activity check failed: {exc}", file=sys.stderr)
+            # Честно прерываем выполнение, чтобы GitHub Action упал (failed), 
+            # а не продолжил работу с ложным предположением, что рынок открыт.
+            raise RuntimeError("Не удалось проверить статус рынка MOEX из-за сетевой ошибки") from exc
 
     return True, "торговая сессия активна"
 
@@ -180,54 +185,72 @@ def fetch_all_share_quotes() -> list[Quote]:
     """Return quotes for all MOEX share listings, deduplicated by SECID."""
     by_secid: dict[str, Quote] = {}
     start = 0
-
-    while True:
-        response = requests.get(
-            MOEX_SHARES_URL,
-            params={
-                "iss.meta": "off",
-                "iss.only": "securities,marketdata",
-                "securities.columns": "SECID,SHORTNAME,BOARDID",
-                "marketdata.columns": "SECID,OPEN,LAST",
-                "start": start,
-                "limit": PAGE_SIZE,
-            },
-            timeout=30,
-        )
-        response.raise_for_status()
-        payload = response.json()
-
-        securities = payload["securities"]["data"]
-        marketdata = payload["marketdata"]["data"]
-        if not securities:
-            break
-
-        sec_index = {name: idx for idx, name in enumerate(payload["securities"]["columns"])}
-        md_index = {name: idx for idx, name in enumerate(payload["marketdata"]["columns"])}
-
-        for sec_row, md_row in zip(securities, marketdata, strict=False):
-            secid = sec_row[sec_index["SECID"]]
-            shortname = sec_row[sec_index["SHORTNAME"]]
-            boardid = sec_row[sec_index["BOARDID"]]
-            open_raw = md_row[md_index["OPEN"]]
-            last_raw = md_row[md_index["LAST"]]
-            open_price = float(open_raw) if open_raw is not None else None
-            last_price = float(last_raw) if last_raw is not None else None
-
-            candidate = Quote(
-                secid=secid,
-                shortname=shortname,
-                boardid=boardid,
-                open_price=open_price,
-                last_price=last_price,
+    
+    # Используем сессию для переиспользования HTTP-соединения (Keep-Alive) при пагинации
+    session = requests.Session()
+    try:
+        while True:
+            response = session.get(
+                MOEX_SHARES_URL,
+                params={
+                    "iss.meta": "off",
+                    "iss.only": "securities,marketdata",
+                    "securities.columns": "SECID,SHORTNAME,BOARDID",
+                    "marketdata.columns": "SECID,OPEN,LAST",
+                    "start": start,
+                    "limit": PAGE_SIZE,
+                },
+                timeout=30,
             )
-            existing = by_secid.get(secid)
-            if existing is None or should_replace(existing, candidate):
-                by_secid[secid] = candidate
+            response.raise_for_status()
+            payload = response.json()
 
-        if len(securities) < PAGE_SIZE:
-            break
-        start += PAGE_SIZE
+            securities = payload["securities"]["data"]
+            if not securities:
+                break
+
+            sec_index = {name: idx for idx, name in enumerate(payload["securities"]["columns"])}
+
+            # Создаем словарь для безопасного сопоставления по SECID вместо ненадежного zip()
+            md_dict = {}
+            if "marketdata" in payload and payload["marketdata"]["data"]:
+                md_columns = payload["marketdata"]["columns"]
+                md_index = {name: idx for idx, name in enumerate(md_columns)}
+                for md_row in payload["marketdata"]["data"]:
+                    secid = md_row[md_index["SECID"]]
+                    md_dict[secid] = {
+                        "OPEN": md_row[md_index["OPEN"]],
+                        "LAST": md_row[md_index["LAST"]]
+                    }
+
+            for sec_row in securities:
+                secid = sec_row[sec_index["SECID"]]
+                shortname = sec_row[sec_index["SHORTNAME"]]
+                boardid = sec_row[sec_index["BOARDID"]]
+
+                md = md_dict.get(secid, {})
+                open_raw = md.get("OPEN")
+                last_raw = md.get("LAST")
+
+                open_price = float(open_raw) if open_raw is not None else None
+                last_price = float(last_raw) if last_raw is not None else None
+
+                candidate = Quote(
+                    secid=secid,
+                    shortname=shortname,
+                    boardid=boardid,
+                    open_price=open_price,
+                    last_price=last_price,
+                )
+                existing = by_secid.get(secid)
+                if existing is None or should_replace(existing, candidate):
+                    by_secid[secid] = candidate
+
+            if len(securities) < PAGE_SIZE:
+                break
+            start += PAGE_SIZE
+    finally:
+        session.close()
 
     return list(by_secid.values())
 
@@ -301,7 +324,7 @@ def send_telegram_message(token: str, chat_id: str, text: str) -> None:
             "chat_id": chat_id,
             "text": text,
             "parse_mode": "HTML",
-            "disable_web_page_preview": True,
+            "link_preview_options": {"is_disabled": True},  # Современная замена disable_web_page_preview
         },
         timeout=30,
     )
@@ -330,12 +353,14 @@ def main() -> None:
     print(f"Found {len(movers)} movers above {threshold}%")
 
     if movers:
-        message = format_message(movers, threshold, len(quotes))
+        # Ограничиваем количество выводимых бумаг, чтобы гарантированно уложиться в лимит 4096 символов
+        displayed_movers = movers[:MAX_MOVERS_IN_MESSAGE]
+        message = format_message(displayed_movers, threshold, len(quotes))
+        
+        if len(movers) > MAX_MOVERS_IN_MESSAGE:
+            message += f"\n\n<i>... и ещё {len(movers) - MAX_MOVERS_IN_MESSAGE} бумаг</i>"
     else:
         message = format_empty_message(threshold, len(quotes))
-
-    if len(message) > 4096:
-        message = message[:4090] + "..."
 
     send_telegram_message(token, chat_id, message)
     print("Message sent to Telegram")
