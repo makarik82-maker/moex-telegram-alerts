@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import sys
+import logging
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from zoneinfo import ZoneInfo
@@ -13,11 +14,12 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# Настройки
 MOEX_STATUS_URL = "https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities/SBER.json"
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 MSK = ZoneInfo("Europe/Moscow")
-MAX_MOVERS_IN_MESSAGE = 25  # Уменьшили до 25 для гарантированного попадания в 4096 символов
-MAX_STOCKS_TO_CHECK = 50    # Жесткое ограничение
+MAX_MOVERS_IN_MESSAGE = 25
+MAX_STOCKS_TO_CHECK = 50
 
 # ТОП-50 самых ликвидных акций MOEX (TQBR)
 TOP_50_TICKERS = [
@@ -32,6 +34,13 @@ TOP_50_TICKERS = [
     "AFKS", "MTLR", "CHMK", "NAKO", "BANE",
     "BANEP", "TRNF", "TRNFP", "VSMO", "MTLRP"
 ]
+
+# Настройка логирования как в рабочем скрипте
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger("moexbot")
 
 
 @dataclass(frozen=True)
@@ -62,7 +71,7 @@ def create_session() -> requests.Session:
 def env(name: str, default: str | None = None) -> str:
     value = os.environ.get(name, default)
     if not value:
-        print(f"❌ Missing required environment variable: {name}", file=sys.stderr)
+        logger.error("Не задана необходимая переменная окружения: %s", name)
         sys.exit(1)
     return value
 
@@ -136,7 +145,7 @@ def is_moex_trading_session(now: datetime | None = None) -> tuple[bool, str]:
             if not market_has_today_quotes():
                 return False, "биржа сегодня не торгует"
         except requests.RequestException as exc:
-            print(f"⚠️ Market activity check failed: {exc}", file=sys.stderr)
+            logger.error("Ошибка проверки статуса рынка: %s", exc)
             raise RuntimeError("Не удалось проверить статус рынка MOEX") from exc
 
     return True, "торговая сессия активна"
@@ -162,7 +171,7 @@ def fetch_top_quotes() -> list[Quote]:
 
         securities = payload.get("securities", {}).get("data", [])
         if not securities:
-            print("⚠️ No data received from MOEX")
+            logger.warning("MOEX не вернул данных")
             return []
 
         sec_index = {name: idx for idx, name in enumerate(payload["securities"]["columns"])}
@@ -201,7 +210,6 @@ def fetch_top_quotes() -> list[Quote]:
                     last_price=last_price
                 ))
 
-        # ЖЕСТКОЕ ограничение: берем не более MAX_STOCKS_TO_CHECK
         return quotes[:MAX_STOCKS_TO_CHECK]
     finally:
         session.close()
@@ -228,7 +236,8 @@ def find_movers(quotes: list[Quote], threshold_pct: float) -> list[StockMove]:
 def format_header(threshold_pct: float, securities_checked: int) -> str:
     now = datetime.now(MSK)
     return (
-        f"<b>MOEX ТОП-{securities_checked} — изменение &gt; {threshold_pct:g}% с открытия</b>\n"
+        f"📈 <strong>MOEX ТОП-{securities_checked}</strong>\n"
+        f"Изменение &gt; {threshold_pct:g}% с открытия\n"
         f"<i>{now.strftime('%d.%m.%Y %H:%M')} MSK</i>\n\n"
     )
 
@@ -240,7 +249,7 @@ def format_message(movers: list[StockMove], threshold_pct: float, securities_che
         direction = "🟢" if move.change_pct > 0 else "🔴"
         sign = "+" if move.change_pct > 0 else ""
         lines.append(
-            f"{direction} <b>{move.secid}</b> ({move.shortname}): "
+            f"{direction} <strong>{move.secid}</strong> ({move.shortname}): "
             f"{sign}{move.change_pct:.2f}% — {move.last_price:.2f} ₽ "
             f"(откр. {move.open_price:.2f})"
         )
@@ -254,57 +263,79 @@ def format_empty_message(threshold_pct: float, securities_checked: int) -> str:
     )
 
 
-def send_telegram_message(token: str, chat_id: str, text: str) -> None:
-    session = create_session()
+def send_to_telegram(token: str, chat_id: str, text: str) -> bool:
+    """Отправляет сообщение в Telegram, копируя логику рабочего скрипта."""
+    logger.info("Отправляю сообщение в Telegram...")
+
+    if not token:
+        logger.error("TELEGRAM_BOT_TOKEN не задан.")
+        return False
+    if not chat_id:
+        logger.error("TELEGRAM_CHAT_ID не задан.")
+        return False
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+
+    # Используем data= вместо json=, как в рабочем скрипте
+    # Используем disable_web_page_preview, как в рабочем скрипте
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+
     try:
-        response = session.post(
-            TELEGRAM_API_URL.format(token=token),
-            json={
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": "HTML",
-                "link_preview_options": {"is_disabled": True},
-            },
-            timeout=15,
+        response = requests.post(
+            url,
+            data=payload,
+            timeout=30,
         )
-        
-        # 🔍 ВАЖНО: Выводим точный ответ Telegram для диагностики
-        response_data = response.json()
-        if not response_data.get("ok"):
-            print(f"❌ Telegram API Error Details: {response_data}")
-            response.raise_for_status()
-            
-    except requests.exceptions.HTTPError as e:
-        print(f"❌ HTTP Error: {e}")
-        print(f"❌ Response Text: {response.text}")
-        raise RuntimeError("Failed to send Telegram message") from e
-    finally:
-        session.close()
+        response.raise_for_status()
+
+        result = response.json()
+
+        if not result.get("ok"):
+            logger.error("Telegram вернул ошибку: %s", result)
+            return False
+
+        message_id = (result.get("result") or {}).get("message_id")
+        logger.info("✅ Сообщение успешно отправлено в Telegram. message_id=%s", message_id)
+        return True
+
+    except requests.HTTPError as exc:
+        logger.error("HTTP ошибка Telegram: %s", exc)
+        try:
+            logger.error("Ответ Telegram: %s", response.text[:2000])
+        except Exception:
+            pass
+        return False
+    except Exception as exc:
+        logger.error("Ошибка отправки в Telegram: %s", exc)
+        return False
 
 
 def main() -> None:
-    print("🚀 Starting MOEX Alert Script (TOP-50)...")
-    start_time = datetime.now()
+    logger.info("==========================================")
+    logger.info(" MOEX ALERT BOT — START")
+    logger.info("==========================================")
 
     token = env("TELEGRAM_BOT_TOKEN")
     chat_id = env("TELEGRAM_CHAT_ID")
     threshold = float(os.environ.get("CHANGE_THRESHOLD", "3"))
 
-    print("⏰ Checking if MOEX is trading...")
+    logger.info("Проверка торговой сессии...")
     is_trading, reason = is_moex_trading_session()
     if not is_trading:
-        print(f"⏸️  Skipping run: {reason}")
+        logger.info("⏸️ Пропуск запуска: %s", reason)
         return
 
-    print("📊 Fetching TOP-50 MOEX stocks...")
-    fetch_start = datetime.now()
+    logger.info("Загрузка котировок ТОП-%d...", MAX_STOCKS_TO_CHECK)
     quotes = fetch_top_quotes()
-    fetch_time = (datetime.now() - fetch_start).total_seconds()
-    print(f"✅ Loaded {len(quotes)} stocks in {fetch_time:.1f}s")
+    logger.info("✅ Загружено %d акций", len(quotes))
 
-    print(f"📈 Finding movers above {threshold}%...")
     movers = find_movers(quotes, threshold)
-    print(f"🎯 Found {len(movers)} movers")
+    logger.info("🎯 Найдено %d акций с изменением >%s%%", len(movers), threshold)
 
     if movers:
         displayed_movers = movers[:MAX_MOVERS_IN_MESSAGE]
@@ -314,13 +345,19 @@ def main() -> None:
     else:
         message = format_empty_message(threshold, len(quotes))
 
-    print(f"📤 Sending message to Telegram (Length: {len(message)} chars)...")
-    send_start = datetime.now()
-    send_telegram_message(token, chat_id, message)
-    send_time = (datetime.now() - send_start).total_seconds()
+    logger.info("Финальный пост готов: %d символов", len(message))
 
-    total_time = (datetime.now() - start_time).total_seconds()
-    print(f"✅ Message sent in {send_time:.1f}s (total: {total_time:.1f}s)")
+    success = send_to_telegram(token, chat_id, message)
+
+    if success:
+        logger.info("==========================================")
+        logger.info(" MOEX ALERT BOT — SUCCESS")
+        logger.info("==========================================")
+    else:
+        logger.error("==========================================")
+        logger.error(" MOEX ALERT BOT — FAILED")
+        logger.error("==========================================")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
