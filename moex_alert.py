@@ -13,13 +13,11 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-MOEX_STATUS_URL = (
-    "https://iss.moex.com/iss/engines/stock/markets/shares/"
-    "boards/TQBR/securities/SBER.json"
-)
+MOEX_STATUS_URL = "https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities/SBER.json"
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 MSK = ZoneInfo("Europe/Moscow")
-MAX_MOVERS_IN_MESSAGE = 30
+MAX_MOVERS_IN_MESSAGE = 25  # Уменьшили до 25 для гарантированного попадания в 4096 символов
+MAX_STOCKS_TO_CHECK = 50    # Жесткое ограничение
 
 # ТОП-50 самых ликвидных акций MOEX (TQBR)
 TOP_50_TICKERS = [
@@ -30,9 +28,9 @@ TOP_50_TICKERS = [
     "MOEX", "AFLT", "PIKK", "FIVE", "RASP",
     "SNGS", "SGZH", "HYDR", "FEES", "MSNG",
     "OGKB", "UPRO", "ENPG", "VKCO", "OZON",
-    "TCSG", "CBOM", "CBRF", "BSPB", "VSMO",
-    "TRNF", "TRNFP", "SIBN", "AFKS", "MTLR",
-    "MTLRP", "CHMK", "NAKO", "BANE", "BANEP"
+    "TCSG", "CBOM", "CBRF", "BSPB", "SIBN",
+    "AFKS", "MTLR", "CHMK", "NAKO", "BANE",
+    "BANEP", "TRNF", "TRNFP", "VSMO", "MTLRP"
 ]
 
 
@@ -54,7 +52,6 @@ class StockMove:
 
 
 def create_session() -> requests.Session:
-    """Create optimized HTTP session with retries."""
     session = requests.Session()
     retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
     adapter = HTTPAdapter(max_retries=retry)
@@ -65,7 +62,7 @@ def create_session() -> requests.Session:
 def env(name: str, default: str | None = None) -> str:
     value = os.environ.get(name, default)
     if not value:
-        print(f"Missing required environment variable: {name}", file=sys.stderr)
+        print(f"❌ Missing required environment variable: {name}", file=sys.stderr)
         sys.exit(1)
     return value
 
@@ -91,7 +88,6 @@ def is_within_trading_hours(now: datetime, start: time, end: time) -> bool:
 
 
 def market_has_today_quotes() -> bool:
-    """Check if market is trading using SBER ticker."""
     session = create_session()
     try:
         response = session.get(
@@ -130,10 +126,8 @@ def is_moex_trading_session(now: datetime | None = None) -> tuple[bool, str]:
 
     if not is_weekday(today):
         return False, "выходной день"
-
     if today in holidays:
         return False, "неторговый день (праздник)"
-
     if not is_within_trading_hours(now, start, end):
         return False, f"вне торговых часов ({start.strftime('%H:%M')}–{end.strftime('%H:%M')} MSK)"
 
@@ -142,19 +136,16 @@ def is_moex_trading_session(now: datetime | None = None) -> tuple[bool, str]:
             if not market_has_today_quotes():
                 return False, "биржа сегодня не торгует"
         except requests.RequestException as exc:
-            print(f"Market activity check failed: {exc}", file=sys.stderr)
+            print(f"⚠️ Market activity check failed: {exc}", file=sys.stderr)
             raise RuntimeError("Не удалось проверить статус рынка MOEX") from exc
 
     return True, "торговая сессия активна"
 
 
-def fetch_top_50_quotes() -> list[Quote]:
-    """Fetch quotes for TOP-50 stocks in a single request."""
+def fetch_top_quotes() -> list[Quote]:
     session = create_session()
     try:
-        # MOEX ISS позволяет запрашивать несколько тикеров через запятую
         tickers_str = ",".join(TOP_50_TICKERS)
-        
         response = session.get(
             "https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities.json",
             params={
@@ -210,7 +201,8 @@ def fetch_top_50_quotes() -> list[Quote]:
                     last_price=last_price
                 ))
 
-        return quotes
+        # ЖЕСТКОЕ ограничение: берем не более MAX_STOCKS_TO_CHECK
+        return quotes[:MAX_STOCKS_TO_CHECK]
     finally:
         session.close()
 
@@ -236,9 +228,8 @@ def find_movers(quotes: list[Quote], threshold_pct: float) -> list[StockMove]:
 def format_header(threshold_pct: float, securities_checked: int) -> str:
     now = datetime.now(MSK)
     return (
-        f"<b>MOEX ТОП-50 — изменение &gt; {threshold_pct:g}% с открытия</b>\n"
-        f"<i>{now.strftime('%d.%m.%Y %H:%M')} MSK</i>\n"
-        f"Проверено бумаг: {securities_checked}\n\n"
+        f"<b>MOEX ТОП-{securities_checked} — изменение &gt; {threshold_pct:g}% с открытия</b>\n"
+        f"<i>{now.strftime('%d.%m.%Y %H:%M')} MSK</i>\n\n"
     )
 
 
@@ -276,10 +267,17 @@ def send_telegram_message(token: str, chat_id: str, text: str) -> None:
             },
             timeout=15,
         )
-        response.raise_for_status()
-        body = response.json()
-        if not body.get("ok"):
-            raise RuntimeError(f"Telegram API error: {body}")
+        
+        # 🔍 ВАЖНО: Выводим точный ответ Telegram для диагностики
+        response_data = response.json()
+        if not response_data.get("ok"):
+            print(f"❌ Telegram API Error Details: {response_data}")
+            response.raise_for_status()
+            
+    except requests.exceptions.HTTPError as e:
+        print(f"❌ HTTP Error: {e}")
+        print(f"❌ Response Text: {response.text}")
+        raise RuntimeError("Failed to send Telegram message") from e
     finally:
         session.close()
 
@@ -298,15 +296,15 @@ def main() -> None:
         print(f"⏸️  Skipping run: {reason}")
         return
 
-    print("📊 Fetching TOP-50 MOEX stocks (single request)...")
+    print("📊 Fetching TOP-50 MOEX stocks...")
     fetch_start = datetime.now()
-    quotes = fetch_top_50_quotes()
+    quotes = fetch_top_quotes()
     fetch_time = (datetime.now() - fetch_start).total_seconds()
     print(f"✅ Loaded {len(quotes)} stocks in {fetch_time:.1f}s")
 
     print(f"📈 Finding movers above {threshold}%...")
     movers = find_movers(quotes, threshold)
-    print(f" Found {len(movers)} movers")
+    print(f"🎯 Found {len(movers)} movers")
 
     if movers:
         displayed_movers = movers[:MAX_MOVERS_IN_MESSAGE]
@@ -316,7 +314,7 @@ def main() -> None:
     else:
         message = format_empty_message(threshold, len(quotes))
 
-    print("📤 Sending message to Telegram...")
+    print(f"📤 Sending message to Telegram (Length: {len(message)} chars)...")
     send_start = datetime.now()
     send_telegram_message(token, chat_id, message)
     send_time = (datetime.now() - send_start).total_seconds()
