@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Fetch MOEX stock quotes and post movers (>3% from day open) to Telegram."""
+"""Fetch MOEX stock quotes and post movers (>3% from day open) to Telegram.
+Optimized version with faster data loading."""
 
 from __future__ import annotations
 
@@ -11,6 +12,8 @@ from typing import Iterable
 from zoneinfo import ZoneInfo
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 MOEX_SHARES_URL = "https://iss.moex.com/iss/engines/stock/markets/shares/securities.json"
 MOEX_STATUS_URL = (
@@ -20,9 +23,11 @@ MOEX_STATUS_URL = (
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 MSK = ZoneInfo("Europe/Moscow")
 PAGE_SIZE = 100
-MAX_MOVERS_IN_MESSAGE = 30  # Ограничение для предотвращения превышения лимита 4096 символов
+MAX_MOVERS_IN_MESSAGE = 30
 
-# Prefer main boards when the same ticker is listed on several modes.
+# Основные торговые площадки для быстрой загрузки
+MAIN_BOARDS = {"TQBR", "TQTD", "SMAL"}
+
 BOARD_PRIORITY = {
     "TQBR": 0,
     "TQTD": 1,
@@ -55,6 +60,23 @@ class StockMove:
     open_price: float
     last_price: float
     change_pct: float
+
+
+def create_session() -> requests.Session:
+    """Create optimized HTTP session with retries and connection pooling."""
+    session = requests.Session()
+    
+    # Настройка retry для устойчивости к сетевым ошибкам
+    retry = Retry(
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"]
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+    session.mount("https://", adapter)
+    
+    return session
 
 
 def env(name: str, default: str | None = None) -> str:
@@ -96,34 +118,37 @@ def is_within_trading_hours(
 
 def market_has_today_quotes() -> bool:
     """Use a liquid ticker to detect holidays when the calendar API is unavailable."""
-    response = requests.get(
-        MOEX_STATUS_URL,
-        params={
-            "iss.meta": "off",
-            "iss.only": "marketdata",
-            "marketdata.columns": "SYSTIME,OPEN,LAST",
-        },
-        timeout=30,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    rows = payload["marketdata"]["data"]
-    if not rows:
-        return False
+    session = create_session()
+    try:
+        response = session.get(
+            MOEX_STATUS_URL,
+            params={
+                "iss.meta": "off",
+                "iss.only": "marketdata",
+                "marketdata.columns": "SYSTIME,OPEN,LAST",
+            },
+            timeout=15,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        rows = payload["marketdata"]["data"]
+        if not rows:
+            return False
 
-    columns = payload["marketdata"]["columns"]
-    row = dict(zip(columns, rows[0], strict=False))
-    systime_raw = row.get("SYSTIME")
-    if not systime_raw:
-        return False
+        columns = payload["marketdata"]["columns"]
+        row = dict(zip(columns, rows[0], strict=False))
+        systime_raw = row.get("SYSTIME")
+        if not systime_raw:
+            return False
 
-    # replace(" ", "T") обеспечивает совместимость с datetime.fromisoformat во всех версиях Python 3.10+
-    systime = datetime.fromisoformat(str(systime_raw).replace(" ", "T")).replace(tzinfo=MSK)
-    today = datetime.now(MSK).date()
-    if systime.date() != today:
-        return False
+        systime = datetime.fromisoformat(str(systime_raw).replace(" ", "T")).replace(tzinfo=MSK)
+        today = datetime.now(MSK).date()
+        if systime.date() != today:
+            return False
 
-    return row.get("OPEN") is not None or row.get("LAST") is not None
+        return row.get("OPEN") is not None or row.get("LAST") is not None
+    finally:
+        session.close()
 
 
 def is_moex_trading_session(now: datetime | None = None) -> tuple[bool, str]:
@@ -148,8 +173,6 @@ def is_moex_trading_session(now: datetime | None = None) -> tuple[bool, str]:
                 return False, "биржа сегодня не торгует"
         except requests.RequestException as exc:
             print(f"Market activity check failed: {exc}", file=sys.stderr)
-            # Честно прерываем выполнение, чтобы GitHub Action упал (failed), 
-            # а не продолжил работу с ложным предположением, что рынок открыт.
             raise RuntimeError("Не удалось проверить статус рынка MOEX из-за сетевой ошибки") from exc
 
     return True, "торговая сессия активна"
@@ -182,12 +205,11 @@ def should_replace(existing: Quote, candidate: Quote) -> bool:
 
 
 def fetch_all_share_quotes() -> list[Quote]:
-    """Return quotes for all MOEX share listings, deduplicated by SECID."""
+    """Return quotes for all MOEX share listings, optimized for speed."""
     by_secid: dict[str, Quote] = {}
     start = 0
     
-    # Используем сессию для переиспользования HTTP-соединения (Keep-Alive) при пагинации
-    session = requests.Session()
+    session = create_session()
     try:
         while True:
             response = session.get(
@@ -200,7 +222,7 @@ def fetch_all_share_quotes() -> list[Quote]:
                     "start": start,
                     "limit": PAGE_SIZE,
                 },
-                timeout=30,
+                timeout=20,
             )
             response.raise_for_status()
             payload = response.json()
@@ -211,7 +233,6 @@ def fetch_all_share_quotes() -> list[Quote]:
 
             sec_index = {name: idx for idx, name in enumerate(payload["securities"]["columns"])}
 
-            # Создаем словарь для безопасного сопоставления по SECID вместо ненадежного zip()
             md_dict = {}
             if "marketdata" in payload and payload["marketdata"]["data"]:
                 md_columns = payload["marketdata"]["columns"]
@@ -227,6 +248,10 @@ def fetch_all_share_quotes() -> list[Quote]:
                 secid = sec_row[sec_index["SECID"]]
                 shortname = sec_row[sec_index["SHORTNAME"]]
                 boardid = sec_row[sec_index["BOARDID"]]
+
+                # ОПТИМИЗАЦИЯ: пропускаем неосновные площадки
+                if boardid not in MAIN_BOARDS:
+                    continue
 
                 md = md_dict.get(secid, {})
                 open_raw = md.get("OPEN")
@@ -249,6 +274,11 @@ def fetch_all_share_quotes() -> list[Quote]:
             if len(securities) < PAGE_SIZE:
                 break
             start += PAGE_SIZE
+            
+            # Вывод прогресса
+            if start % 300 == 0:
+                print(f"  Loaded {len(by_secid)} securities so far...")
+
     finally:
         session.close()
 
@@ -318,42 +348,53 @@ def format_empty_message(threshold_pct: float, securities_checked: int) -> str:
 
 
 def send_telegram_message(token: str, chat_id: str, text: str) -> None:
-    response = requests.post(
-        TELEGRAM_API_URL.format(token=token),
-        json={
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "link_preview_options": {"is_disabled": True},  # Современная замена disable_web_page_preview
-        },
-        timeout=30,
-    )
-    response.raise_for_status()
-    body = response.json()
-    if not body.get("ok"):
-        raise RuntimeError(f"Telegram API error: {body}")
+    session = create_session()
+    try:
+        response = session.post(
+            TELEGRAM_API_URL.format(token=token),
+            json={
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "link_preview_options": {"is_disabled": True},
+            },
+            timeout=15,
+        )
+        response.raise_for_status()
+        body = response.json()
+        if not body.get("ok"):
+            raise RuntimeError(f"Telegram API error: {body}")
+    finally:
+        session.close()
 
 
 def main() -> None:
+    print(" Starting MOEX Alert Script...")
+    start_time = datetime.now()
+    
     token = env("TELEGRAM_BOT_TOKEN")
     chat_id = env("TELEGRAM_CHAT_ID")
     threshold = float(os.environ.get("CHANGE_THRESHOLD", "3"))
 
+    print("⏰ Checking if MOEX is trading...")
     is_trading, reason = is_moex_trading_session()
     if not is_trading:
-        print(f"Skipping run: {reason}")
+        print(f"️  Skipping run: {reason}")
         return
 
-    print("Fetching quotes for all MOEX shares...")
+    print("📊 Fetching quotes for MOEX shares (optimized: TQBR+TQTD+SMAL only)...")
+    fetch_start = datetime.now()
     quotes = fetch_all_share_quotes()
+    fetch_time = (datetime.now() - fetch_start).total_seconds()
+    
     usable_quotes = [quote for quote in quotes if quote_is_usable(quote)]
-    print(f"Loaded {len(quotes)} unique securities ({len(usable_quotes)} with quotes)")
+    print(f"✅ Loaded {len(quotes)} unique securities ({len(usable_quotes)} with quotes) in {fetch_time:.1f}s")
 
+    print(f"📈 Finding movers above {threshold}%...")
     movers = find_movers(quotes, threshold)
-    print(f"Found {len(movers)} movers above {threshold}%")
+    print(f"🎯 Found {len(movers)} movers")
 
     if movers:
-        # Ограничиваем количество выводимых бумаг, чтобы гарантированно уложиться в лимит 4096 символов
         displayed_movers = movers[:MAX_MOVERS_IN_MESSAGE]
         message = format_message(displayed_movers, threshold, len(quotes))
         
@@ -362,8 +403,13 @@ def main() -> None:
     else:
         message = format_empty_message(threshold, len(quotes))
 
+    print(" Sending message to Telegram...")
+    send_start = datetime.now()
     send_telegram_message(token, chat_id, message)
-    print("Message sent to Telegram")
+    send_time = (datetime.now() - send_start).total_seconds()
+    
+    total_time = (datetime.now() - start_time).total_seconds()
+    print(f"✅ Message sent in {send_time:.1f}s (total: {total_time:.1f}s)")
 
 
 if __name__ == "__main__":
